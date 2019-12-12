@@ -48,11 +48,6 @@ public class RecoveredReplicationSourceShipper extends ReplicationSourceShipper 
   }
 
   @Override
-  protected void postFinish() {
-    source.tryFinish();
-  }
-
-  @Override
   public long getStartPosition() {
     long startPosition = getRecoveredQueueStartPos();
     int numRetries = 0;

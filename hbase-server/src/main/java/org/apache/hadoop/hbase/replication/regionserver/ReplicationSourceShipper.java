@@ -22,6 +22,7 @@ import static org.apache.hadoop.hbase.replication.ReplicationUtils.sleepForRetri
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.PriorityBlockingQueue;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -30,7 +31,6 @@ import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
-import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -82,7 +82,7 @@ public class ReplicationSourceShipper extends Thread {
     this.conf = conf;
     this.walGroupId = walGroupId;
     this.queue = queue;
-    this.source = source;
+    this.source = Objects.requireNonNull(source);
     this.sleepForRetries =
         this.conf.getLong("replication.source.sleepforretries", 1000);    // 1 second
     this.maxRetriesMultiplier =
@@ -95,6 +95,8 @@ public class ReplicationSourceShipper extends Thread {
 
   @Override
   public final void run() {
+    Objects.requireNonNull(this.entryReader);
+
     setWorkerState(WorkerState.RUNNING);
     LOG.info("Running ReplicationSourceShipper Thread for wal group: {}", this.walGroupId);
     // Loop until we close down
@@ -127,10 +129,9 @@ public class ReplicationSourceShipper extends Thread {
     // If the worker exits run loop without finishing its task, mark it as stopped.
     if (!isFinished()) {
       setWorkerState(WorkerState.STOPPED);
-    } else {
-      source.removeWorker(this);
-      postFinish();
     }
+
+    this.entryReader.stopReaderRunning();
   }
 
   private void noMoreData() {
@@ -142,10 +143,6 @@ public class ReplicationSourceShipper extends Thread {
       LOG.debug("Finished queue for group {} of peer {}", walGroupId, source.getQueueId());
     }
     setWorkerState(WorkerState.FINISHED);
-  }
-
-  // To be implemented by recovered shipper
-  protected void postFinish() {
   }
 
   /**
@@ -286,12 +283,6 @@ public class ReplicationSourceShipper extends Thread {
       currentPosition = batch.getLastWalPosition();
     }
     return updated;
-  }
-
-  public void startup(UncaughtExceptionHandler handler) {
-    String name = Thread.currentThread().getName();
-    Threads.setDaemonThreadRunning(this,
-      name + ".replicationSource.shipper" + walGroupId + "," + source.getQueueId(), handler);
   }
 
   Path getCurrentPath() {

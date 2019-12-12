@@ -23,7 +23,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -31,10 +30,12 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
@@ -68,6 +69,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.MoreExecutors;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Class that handles the source of a replication stream.
@@ -125,9 +129,15 @@ public class ReplicationSource implements ReplicationSourceInterface {
   private long defaultBandwidth;
   private long currentBandwidth;
   private WALFileLengthProvider walFileLengthProvider;
+
   @VisibleForTesting
-  protected final ConcurrentHashMap<String, ReplicationSourceShipper> workerThreads =
+  protected final Map<String, ReplicationSourceShipper> workerThreads =
       new ConcurrentHashMap<>();
+
+  private final ListeningExecutorService executorService =
+      MoreExecutors.listeningDecorator(Executors.newCachedThreadPool(
+        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("replicationSource-%d")
+            .setUncaughtExceptionHandler(this::uncaughtException).build()));
 
   private AtomicLong totalBufferUsed;
 
@@ -304,31 +314,47 @@ public class ReplicationSource implements ReplicationSourceInterface {
     this.walEntryFilter = new ChainWALEntryFilter(filters);
   }
 
-  private void tryStartNewShipper(String walGroupId, PriorityBlockingQueue<Path> queue) {
-    workerThreads.compute(walGroupId, (key, value) -> {
-      if (value != null) {
-        if (LOG.isDebugEnabled()) {
-          LOG.debug(
-              "{} Someone has beat us to start a worker thread for wal group {}",
-              logPeerId(), key);
-        }
-        return value;
-      } else {
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("{} Starting up worker for wal group {}", logPeerId(), key);
-        }
-        ReplicationSourceShipper worker = createNewShipper(walGroupId, queue);
-        ReplicationSourceWALReader walReader =
-            createNewWALReader(walGroupId, queue, worker.getStartPosition());
-        Threads.setDaemonThreadRunning(
-            walReader, Thread.currentThread().getName()
-                + ".replicationSource.wal-reader." + walGroupId + "," + queueId,
-            this::uncaughtException);
-        worker.setWALReader(walReader);
-        worker.startup(this::uncaughtException);
-        return worker;
+  /**
+   * Synchronized method so that only one item is inserted at a time. Should be the only place that
+   * insertions are performed on the workerThreads data structure.
+   *
+   * @param walGroupId The WAL group ID
+   * @param queue The queue of paths to process
+   */
+  private synchronized void tryStartNewShipper(final String walGroupId,
+      final PriorityBlockingQueue<Path> queue) {
+
+    if (workerThreads.containsKey(walGroupId)) {
+      return;
+    }
+
+    LOG.debug("{} Register worker for wallGroupID {}", logPeerId(), walGroupId);
+    ReplicationSourceShipper worker = createNewShipper(walGroupId, queue);
+
+    ReplicationSourceWALReader walReader =
+        createNewWALReader(walGroupId, queue, worker.getStartPosition());
+    worker.setWALReader(walReader);
+
+    workerThreads.put(walGroupId, worker);
+
+    // Kick of the WAL reader first to get a head start
+    executorService.submit(walReader);
+
+    // Add hook to unregister worker when it completes
+    // Be mindful. Listener may run in this thread or in the worker thread, just depends on if the
+    // worker finishes quickly, before the listener is even applied. If it is run in this thread, be
+    // careful not to dead lock on something.
+    executorService.submit(worker).addListener(new Runnable() {
+      @Override
+      public void run() {
+        LOG.debug("Unregister worker node for wallGroupID: {}", walGroupId);
+        workerThreads.remove(walGroupId);
+        tryFinish();
       }
-    });
+    }, MoreExecutors.directExecutor());
+  }
+
+  protected void tryFinish() {
   }
 
   @Override
@@ -453,9 +479,7 @@ public class ReplicationSource implements ReplicationSourceInterface {
       }
       Thread.sleep(this.sleepForRetries * sleepMultiplier);
     } catch (InterruptedException e) {
-      if(LOG.isDebugEnabled()) {
-        LOG.debug("{} Interrupted while sleeping between retries", logPeerId());
-      }
+      LOG.debug("{} Interrupted while sleeping between retries", logPeerId());
       Thread.currentThread().interrupt();
     }
     return sleepMultiplier < maxRetriesMultiplier;
@@ -527,6 +551,7 @@ public class ReplicationSource implements ReplicationSourceInterface {
       logPeerId(), this.replicationQueueInfo.getQueueId(), clusterId, peerClusterId);
 
     initializeWALEntryFilter(peerClusterId);
+
     // start workers
     for (Map.Entry<String, PriorityBlockingQueue<Path>> entry : queues.entrySet()) {
       String walGroupId = entry.getKey();
@@ -557,10 +582,6 @@ public class ReplicationSource implements ReplicationSourceInterface {
 
   @Override
   public void terminate(String reason, Exception cause, boolean clearMetrics) {
-    terminate(reason, cause, clearMetrics, true);
-  }
-
-  public void terminate(String reason, Exception cause, boolean clearMetrics, boolean join) {
     if (cause == null) {
       LOG.info("{} Closing source {} because: {}", logPeerId(), this.queueId, reason);
     } else {
@@ -575,50 +596,22 @@ public class ReplicationSource implements ReplicationSourceInterface {
       initThread.interrupt();
       Threads.shutdown(initThread, this.sleepForRetries);
     }
-    Collection<ReplicationSourceShipper> workers = workerThreads.values();
-    for (ReplicationSourceShipper worker : workers) {
-      worker.stopWorker();
-      if(worker.entryReader != null) {
-        worker.entryReader.setReaderRunning(false);
-      }
-    }
 
-    for (ReplicationSourceShipper worker : workers) {
-      if (worker.isAlive() || worker.entryReader.isAlive()) {
-        try {
-          // Wait worker to stop
-          Thread.sleep(this.sleepForRetries);
-        } catch (InterruptedException e) {
-          LOG.info("{} Interrupted while waiting {} to stop", logPeerId(), worker.getName());
-          Thread.currentThread().interrupt();
-        }
-        // If worker still is alive after waiting, interrupt it
-        if (worker.isAlive()) {
-          worker.interrupt();
-        }
-        // If entry reader is alive after waiting, interrupt it
-        if (worker.entryReader.isAlive()) {
-          worker.entryReader.interrupt();
-        }
-      }
+    final boolean shutdownSuccess = MoreExecutors.shutdownAndAwaitTermination(this.executorService,
+      10L, TimeUnit.SECONDS);
+    if (!shutdownSuccess) {
+      LOG.info("{} Unable to shutdown thread pool completely", logPeerId());
     }
 
     if (this.replicationEndpoint != null) {
       this.replicationEndpoint.stop();
-    }
-    if (join) {
-      for (ReplicationSourceShipper worker : workers) {
-        Threads.shutdown(worker, this.sleepForRetries);
-        LOG.info("{} ReplicationSourceWorker {} terminated", logPeerId(), worker.getName());
-      }
-      if (this.replicationEndpoint != null) {
-        try {
-          this.replicationEndpoint.awaitTerminated(sleepForRetries * maxRetriesMultiplier,
-            TimeUnit.MILLISECONDS);
-        } catch (TimeoutException te) {
-          LOG.warn("{} Got exception while waiting for endpoint to shutdown "
-            + "for replication source : {}", logPeerId(), this.queueId, te);
-        }
+      try {
+        this.replicationEndpoint.awaitTerminated(sleepForRetries * maxRetriesMultiplier,
+          TimeUnit.MILLISECONDS);
+      } catch (TimeoutException te) {
+        LOG.warn("{} Got exception while waiting for endpoint to shutdown "
+            + "for replication source : {}",
+          logPeerId(), this.queueId, te);
       }
     }
     if (clearMetrics) {
@@ -680,13 +673,8 @@ public class ReplicationSource implements ReplicationSourceInterface {
     return replicationQueueInfo;
   }
 
-  public boolean isWorkerRunning(){
-    for(ReplicationSourceShipper worker : this.workerThreads.values()){
-      if(worker.isActive()){
-        return worker.isActive();
-      }
-    }
-    return false;
+  public boolean isWorkerRunning() {
+    return !this.workerThreads.isEmpty();
   }
 
   @Override
@@ -746,10 +734,6 @@ public class ReplicationSource implements ReplicationSourceInterface {
 
   ReplicationQueueStorage getQueueStorage() {
     return queueStorage;
-  }
-
-  void removeWorker(ReplicationSourceShipper worker) {
-    workerThreads.remove(worker.walGroupId, worker);
   }
 
   private String logPeerId(){
