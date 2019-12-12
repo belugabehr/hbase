@@ -58,6 +58,7 @@ import org.apache.hadoop.hbase.replication.ReplicationQueueInfo;
 import org.apache.hadoop.hbase.replication.ReplicationQueueStorage;
 import org.apache.hadoop.hbase.replication.SystemTableWALEntryFilter;
 import org.apache.hadoop.hbase.replication.WALEntryFilter;
+import org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceShipper.WorkerState;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Threads;
@@ -69,6 +70,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.FutureCallback;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.Futures;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListenableFuture;
 import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
 import org.apache.hbase.thirdparty.com.google.common.util.concurrent.MoreExecutors;
 import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -333,6 +337,8 @@ public class ReplicationSource implements ReplicationSourceInterface {
 
     ReplicationSourceWALReader walReader =
         createNewWALReader(walGroupId, queue, worker.getStartPosition());
+
+    // Worker will stop walReader when it stops
     worker.setWALReader(walReader);
 
     workerThreads.put(walGroupId, worker);
@@ -344,12 +350,19 @@ public class ReplicationSource implements ReplicationSourceInterface {
     // Be mindful. Listener may run in this thread or in the worker thread, just depends on if the
     // worker finishes quickly, before the listener is even applied. If it is run in this thread, be
     // careful not to dead lock on something.
-    executorService.submit(worker).addListener(new Runnable() {
-      @Override
-      public void run() {
-        LOG.debug("Unregister worker node for wallGroupID: {}", walGroupId);
-        workerThreads.remove(walGroupId);
-        tryFinish();
+    ListenableFuture<ReplicationSourceShipper.WorkerState> f = executorService.submit(worker);
+    Futures.addCallback(f, new FutureCallback<ReplicationSourceShipper.WorkerState>() {
+      public void onSuccess(ReplicationSourceShipper.WorkerState state) {
+        LOG.debug("ReplicationSourceShipper finished: [state={}]", state);
+        if (state == WorkerState.FINISHED) {
+          LOG.debug("Unregister worker node for wallGroupID: {}", walGroupId);
+          workerThreads.remove(walGroupId);
+          tryFinish();
+        }
+      }
+
+      public void onFailure(Throwable thrown) {
+        LOG.warn("Thread failed", thrown);
       }
     }, MoreExecutors.directExecutor());
   }

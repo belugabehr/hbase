@@ -23,7 +23,9 @@ import static org.apache.hadoop.hbase.replication.ReplicationUtils.sleepForRetri
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Callable;
 import java.util.concurrent.PriorityBlockingQueue;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
@@ -45,7 +47,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.StoreDescript
  * ReplicationSourceWALReaderThread
  */
 @InterfaceAudience.Private
-public class ReplicationSourceShipper extends Thread {
+public class ReplicationSourceShipper implements Callable<ReplicationSourceShipper.WorkerState> {
   private static final Logger LOG = LoggerFactory.getLogger(ReplicationSourceShipper.class);
 
   // Hold the state of a replication worker thread
@@ -94,7 +96,7 @@ public class ReplicationSourceShipper extends Thread {
   }
 
   @Override
-  public final void run() {
+  public WorkerState call() throws Exception {
     Objects.requireNonNull(this.entryReader);
 
     setWorkerState(WorkerState.RUNNING);
@@ -109,7 +111,7 @@ public class ReplicationSourceShipper extends Thread {
         continue;
       }
       try {
-        WALEntryBatch entryBatch = entryReader.poll(getEntriesTimeout);
+        WALEntryBatch entryBatch = this.entryReader.poll(getEntriesTimeout);
         LOG.debug("Shipper from source {} got entry batch from reader: {}",
             source.getQueueId(), entryBatch);
         if (entryBatch == null) {
@@ -123,15 +125,18 @@ public class ReplicationSourceShipper extends Thread {
         }
       } catch (InterruptedException e) {
         LOG.trace("Interrupted while waiting for next replication entry batch", e);
-        Thread.currentThread().interrupt();
+        break;
       }
     }
+
     // If the worker exits run loop without finishing its task, mark it as stopped.
     if (!isFinished()) {
       setWorkerState(WorkerState.STOPPED);
     }
 
     this.entryReader.stopReaderRunning();
+
+    return this.state;
   }
 
   private void noMoreData() {
@@ -151,10 +156,10 @@ public class ReplicationSourceShipper extends Thread {
    */
   private int getBatchEntrySizeExcludeBulkLoad(WALEntryBatch entryBatch) {
     int totalSize = 0;
-    for(Entry entry : entryBatch.getWalEntries()) {
-      totalSize += entryReader.getEntrySizeExcludeBulkLoad(entry);
+    for (Entry entry : entryBatch.getWalEntries()) {
+      totalSize += ReplicationSourceWALReader.getEntrySizeExcludeBulkLoad(entry);
     }
-    return  totalSize;
+    return totalSize;
   }
 
   /**
@@ -302,7 +307,7 @@ public class ReplicationSourceShipper extends Thread {
   }
 
   protected boolean isActive() {
-    return source.isSourceActive() && state == WorkerState.RUNNING && !isInterrupted();
+    return source.isSourceActive() && state == WorkerState.RUNNING;
   }
 
   protected final void setWorkerState(WorkerState state) {
@@ -316,4 +321,5 @@ public class ReplicationSourceShipper extends Thread {
   public boolean isFinished() {
     return state == WorkerState.FINISHED;
   }
+
 }
